@@ -1,0 +1,26 @@
+frame=5
+paramLine_length_raw=640
+byte_safe_word_count=320
+
+NOTE: SDK Demo.c does not show how *_length is measured.
+This tool interprets length values as bytes for raw saving and parsing to avoid over-reading SDK buffers.
+If this SDK reports paramLine_length in 16-bit words, the text parse can be intentionally conservative.
+
+head1[0]=0x55AA (21930)
+head2[1]=0x0038 (56)
+distance[3]=0x0032 (50), scaled=/10 => 5.0
+emissivity[4]=0x0062 (98)
+reflectivity[5]=0x00E6 (230)
+shutter_status[28]=0x0000 (0)
+hot_spot_x[44]=0x01A4 (420)
+hot_spot_y[45]=0x0046 (70)
+hot_spot_temperature[46]=0x0169 (u16=361, i16=361), signed_scaled=/10 => 36.1
+cold_spot_x[47]=0x014C (332)
+cold_spot_y[48]=0x007D (125)
+cold_spot_temperature[49]=0x00DC (u16=220, i16=220), signed_scaled=/10 => 22.0
+cursor_x[50]=0x0140 (320)
+cursor_y[51]=0x0100 (256)
+cursor_temperature[52]=0x0113 (u16=275, i16=275), signed_scaled=/10 => 27.5
+regional_mean_temperature[53]=0x011A (u16=282, i16=282), signed_scaled=/10 => 28.2
+
+frame_end_0x6666_positions=59
