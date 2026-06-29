@@ -14,7 +14,12 @@ echo "Архитектура: $ARCH"
 [ "$ARCH" = "aarch64" ] || echo "ВНИМАНИЕ: ожидался aarch64 (Jetson), а здесь $ARCH."
 
 # --- 1) Python venv + зависимости ---
-[ -d .venv ] || python3 -m venv .venv
+[ -x .venv/bin/pip ] || { rm -rf .venv; python3 -m venv .venv 2>/dev/null; }
+if [ ! -x .venv/bin/pip ]; then
+  echo "ОШИБКА: не удалось создать venv с pip. Поставь системные пакеты и перезапусти:"
+  echo "  sudo apt update && sudo apt install -y python3-venv python3-pip python3-dev build-essential"
+  exit 1
+fi
 .venv/bin/pip install --upgrade pip
 echo "-- numpy / opencv-headless / pillow"
 .venv/bin/pip install numpy opencv-python-headless pillow
