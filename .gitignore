@@ -70,3 +70,7 @@ Testing/
 
 # Python virtual environments
 .venv/
+
+# Python cache
+__pycache__/
+*.pyc

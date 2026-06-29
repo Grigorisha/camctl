@@ -1,0 +1,18 @@
+# Python-зависимости camctl.
+# Установка в venv:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# Версии зафиксированы как протестировано на десктопе (x86_64). На Jetson (aarch64)
+# pip подберёт совместимый wheel; если конкретной версии нет под ARM — снять пин (==).
+
+numpy==2.2.6
+opencv-python-headless==4.13.0.92   # БЕЗ GUI-Qt: полный opencv-python тащит Qt5 и падает с PySide6
+pillow==12.2.0
+
+# GUI-просмотрщик. Нужен ТОЛЬКО для viewer_qt.py с дисплеем.
+# На aarch64 wheel может отсутствовать -> ставить системно (apt install python3-pyside6/pyqt5)
+# или вовсе не нужен, если на Jetson работаем headless + RTSP.
+PySide6==6.11.1
+
+# SDK Daheng (чистый Python, грузит системный libgxiapi.so нужной архитектуры).
+# Ставится с PyPI (pip install gxipy) ИЛИ из driwers/Galaxy_Linux_Python.../api (setup.py).
+gxipy==2.0.2412.9191
