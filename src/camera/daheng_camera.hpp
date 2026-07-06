@@ -18,6 +18,17 @@ public:
     void close() override;
     std::string info() const override { return info_; }
 
+    // Прямой доступ к фичам GenICam по имени (best-effort; false = не поддержано/ошибка).
+    // Геометрия (Width/Height/Decimation*) требует остановленного потока — см. camera_service.
+    bool set_float(const char* name, double v);
+    bool set_int(const char* name, int64_t v);
+    bool set_enum(const char* name, const char* v);
+    bool get_float(const char* name, double& v) const;
+    bool get_int(const char* name, int64_t& v) const;
+    bool get_enum(const char* name, std::string& v) const;
+    bool get_float_range(const char* name, double& lo, double& hi) const;
+    bool get_int_range(const char* name, int64_t& lo, int64_t& hi) const;
+
 private:
     std::string serial_;
     std::string info_;

@@ -15,6 +15,7 @@ struct H264EncoderImpl {
     int W = 0, H = 0;
     H264Encoder::NalCallback on_nal;
     uint32_t out_queued = 0;   // сколько output-буферов уже поставлено в очередь
+    bool finished = false;     // EOS уже отправлен (finish идемпотентен)
 };
 
 // Колбэк капчур-плоскости: сюда NVENC отдаёт закодированные H.264 буферы (в своём потоке).
@@ -37,8 +38,7 @@ static bool capture_dq_cb(struct v4l2_buffer* v4l2_buf, NvBuffer* buffer,
 H264Encoder::H264Encoder() : p_(new H264EncoderImpl()) {}
 H264Encoder::~H264Encoder() {
     if (p_->enc) {
-        p_->enc->capture_plane.stopDQThread();
-        p_->enc->capture_plane.waitForDQThread(1000);
+        finish();            // чистый останов через EOS (иначе DQ-поток виснет в ioctl)
         delete p_->enc;
     }
     delete p_;
@@ -149,8 +149,13 @@ void H264Encoder::request_keyframe() {
     if (p_->enc) p_->enc->forceIDR();
 }
 
+void H264Encoder::set_bitrate(int bitrate_bps) {
+    if (p_->enc) p_->enc->setBitrate(static_cast<uint32_t>(bitrate_bps));
+}
+
 void H264Encoder::finish() {
-    if (!p_->enc) return;
+    if (!p_->enc || p_->finished) return;
+    p_->finished = true;
     // Отправить EOS: пустой output-буфер (bytesused=0).
     struct v4l2_buffer v4l2_buf;
     struct v4l2_plane planes[MAX_PLANES];

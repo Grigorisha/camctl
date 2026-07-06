@@ -93,6 +93,48 @@ bool DahengCamera::grab(Frame& out, int timeout_ms) {
     return ok;
 }
 
+// ---- прямой доступ к GenICam-фичам по имени -------------------------------
+
+bool DahengCamera::set_float(const char* name, double v) {
+    return handle_ && GXSetFloatValue(static_cast<GX_DEV_HANDLE>(handle_), name, v) == GX_STATUS_SUCCESS;
+}
+bool DahengCamera::set_int(const char* name, int64_t v) {
+    return handle_ && GXSetIntValue(static_cast<GX_DEV_HANDLE>(handle_), name, v) == GX_STATUS_SUCCESS;
+}
+bool DahengCamera::set_enum(const char* name, const char* v) {
+    return handle_ && GXSetEnumValueByString(static_cast<GX_DEV_HANDLE>(handle_), name, v) == GX_STATUS_SUCCESS;
+}
+bool DahengCamera::get_float(const char* name, double& v) const {
+    if (!handle_) return false;
+    GX_FLOAT_VALUE fv{};
+    if (GXGetFloatValue(static_cast<GX_DEV_HANDLE>(handle_), name, &fv) != GX_STATUS_SUCCESS) return false;
+    v = fv.dCurValue; return true;
+}
+bool DahengCamera::get_int(const char* name, int64_t& v) const {
+    if (!handle_) return false;
+    GX_INT_VALUE iv{};
+    if (GXGetIntValue(static_cast<GX_DEV_HANDLE>(handle_), name, &iv) != GX_STATUS_SUCCESS) return false;
+    v = iv.nCurValue; return true;
+}
+bool DahengCamera::get_enum(const char* name, std::string& v) const {
+    if (!handle_) return false;
+    GX_ENUM_VALUE ev{};
+    if (GXGetEnumValue(static_cast<GX_DEV_HANDLE>(handle_), name, &ev) != GX_STATUS_SUCCESS) return false;
+    v = ev.stCurValue.strCurSymbolic; return true;
+}
+bool DahengCamera::get_float_range(const char* name, double& lo, double& hi) const {
+    if (!handle_) return false;
+    GX_FLOAT_VALUE fv{};
+    if (GXGetFloatValue(static_cast<GX_DEV_HANDLE>(handle_), name, &fv) != GX_STATUS_SUCCESS) return false;
+    lo = fv.dMin; hi = fv.dMax; return true;
+}
+bool DahengCamera::get_int_range(const char* name, int64_t& lo, int64_t& hi) const {
+    if (!handle_) return false;
+    GX_INT_VALUE iv{};
+    if (GXGetIntValue(static_cast<GX_DEV_HANDLE>(handle_), name, &iv) != GX_STATUS_SUCCESS) return false;
+    lo = iv.nMin; hi = iv.nMax; return true;
+}
+
 void DahengCamera::stop() {
     if (handle_) GXStreamOff(static_cast<GX_DEV_HANDLE>(handle_));
 }
