@@ -23,6 +23,7 @@ import os
 import sys
 import glob
 import time
+import signal
 import argparse
 import threading
 
@@ -68,7 +69,16 @@ def open_daheng_by_sn(sn):
 
 
 def setup_daheng(cam):
-    cam.PixelFormat.set(gx.GxPixelFormatEntry.BAYER_RG8)
+    # Формат Байера зависит от модели (NS-301UCL -> RG8, ME2P-2621 -> GB8),
+    # поэтому выбираем поддерживаемый 8-битный Bayer из доступных, а не хардкодим.
+    try:
+        available = cam.PixelFormat.get_range()          # {имя: значение}
+        for name in ("BayerRG8", "BayerGB8", "BayerGR8", "BayerBG8"):
+            if name in available:
+                cam.PixelFormat.set(available[name])
+                break
+    except Exception:
+        pass
 
     def try_set(setter):
         try:
@@ -159,7 +169,10 @@ class DahengWorker(QThread):
             self._status = text
 
     def _open(self):
-        cam = open_daheng_by_sn(self.sn)
+        try:
+            cam = open_daheng_by_sn(self.sn)
+        except Exception:
+            return None                 # камера занята/недоступна — повторим позже
         if cam is None:
             return None
         try:
@@ -547,6 +560,9 @@ def main():
     group.add_argument("--daheng-only", action="store_true",
                        help="запустить только Daheng (без тепловизора)")
     args = parser.parse_args()
+
+    # Ctrl+C должен завершать процесс (Qt по умолчанию перехватывает SIGINT и он "не берётся")
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     app = QtWidgets.QApplication([])  # CLI-аргументы разбирает argparse, не Qt
 

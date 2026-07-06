@@ -1,16 +1,22 @@
 # Установка драйверов и настройка прав
 
-> Статус: черновик
-> Обновлён: 2026-06-26
+> Статус: в работе
+> Обновлён: 2026-07-02
 > Автор:
 
 Как подготовить машину к работе с камерами: драйверы, права на устройства, проверка.
+Развёртывание на **Jetson (aarch64)** описано отдельно —
+[../09-operations/deployment.md](../09-operations/deployment.md) (там же — сборка `.so`
+тепловизора под ARM и `setup_jetson.sh`).
 
 ## RGB-камера (Daheng / gxipy)
 
-1. Установить Galaxy SDK и Python-пакет `gxipy` (по инструкции производителя).
-2. Проверить зависимости примера: `gxipy`, `opencv-python` (`cv2`), `numpy`.
-3. Быстрая проверка: запуск `Test.py` из корня репозитория.
+1. Установить **Galaxy SDK** нужной архитектуры (x86_64 или aarch64) — он ставит
+   системную `libgxiapi.so` + udev-правила. `gxipy` — чистый Python, ставится через pip.
+2. Зависимости приложения: `gxipy`, `opencv-python-headless` (`cv2`), `numpy`, `PySide6`
+   (см. `requirements.txt`). Полный `opencv-python` НЕ использовать — его Qt конфликтует
+   с PySide6.
+3. Быстрая проверка: `.venv/bin/python -c "import gxipy; print(gxipy.DeviceManager().update_all_device_list())"`.
 
 ## Тепловая камера (USB3.0 SC-SDK)
 
@@ -29,13 +35,18 @@ USB-камеры обычно появляются как `/dev/video*` и/ил�
 - Для постоянного доступа — добавить пользователя в группу `video` и/или завести
   **udev-правило** под конкретный VID:PID камеры.
 
-```
-# пример udev-правила (заполнить idVendor/idProduct реальными значениями)
+Реальные VID:PID: Daheng — `2ba2:4d55`, тепловизор PLUG617R — `04b4:f9f9`. Для Daheng
+udev-правило ставит сам Galaxy SDK (`99-galaxy-u3v.rules`), вручную обычно не нужно.
+
+```text
+# пример udev-правила (если ставим вручную)
 # /etc/udev/rules.d/99-camctl.rules
-SUBSYSTEM=="usb", ATTR{idVendor}=="XXXX", ATTR{idProduct}=="YYYY", MODE="0660", GROUP="video"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2ba2", ATTR{idProduct}=="4d55", MODE="0660", GROUP="video"
 ```
 
 После добавления: `sudo udevadm control --reload-rules && sudo udevadm trigger`.
+**Важно:** уже подключённые камеры получают новые права только после `udevadm trigger`
+(или переподключения USB) — иначе `gxipy` вернёт 0 устройств.
 
 ## Проверка
 
