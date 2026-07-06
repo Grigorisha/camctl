@@ -145,6 +145,10 @@ bool H264Encoder::encodeFrame(const uint8_t* i420, size_t /*size*/) {
     return true;
 }
 
+void H264Encoder::request_keyframe() {
+    if (p_->enc) p_->enc->forceIDR();
+}
+
 void H264Encoder::finish() {
     if (!p_->enc) return;
     // Отправить EOS: пустой output-буфер (bytesused=0).

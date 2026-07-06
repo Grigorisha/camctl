@@ -20,6 +20,7 @@ public:
     bool init(int width, int height, int fps, int bitrate_bps);
     void on_nal(NalCallback cb);
     bool encodeFrame(const uint8_t* i420, size_t size);  // size = width*height*3/2
+    void request_keyframe();                              // форсировать IDR (для быстрого входа клиента)
     void finish();                                        // EOS + дождаться слива капчур-потока
 
     H264Encoder(const H264Encoder&) = delete;

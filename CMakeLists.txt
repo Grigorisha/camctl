@@ -22,33 +22,56 @@ target_include_directories(camctl PRIVATE
 # libgxiapi.so ставится в /usr/lib установщиком Galaxy SDK (нужной архитектуры).
 target_link_libraries(camctl gxiapi pthread)
 
-# --- Кодер NVENC: только на Jetson, где есть jetson_multimedia_api ---
+# --- Кодер NVENC + стриминг: только на Jetson, где есть jetson_multimedia_api ---
 set(MMAPI /usr/src/jetson_multimedia_api)
 if(EXISTS ${MMAPI})
   file(GLOB MMAPI_CLASSES ${MMAPI}/samples/common/classes/*.cpp)
+
+  # Общие настройки для целей, использующих NVENC.
+  function(camctl_nvenc_target tgt)
+    target_include_directories(${tgt} PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/third_party/galaxy/include
+      ${MMAPI}/include
+      ${MMAPI}/include/libjpeg-8b
+      /usr/local/cuda/include
+      /usr/include/aarch64-linux-gnu
+      /usr/include/libdrm
+    )
+    target_link_directories(${tgt} PRIVATE
+      /usr/lib/aarch64-linux-gnu/tegra
+      /usr/lib/aarch64-linux-gnu/nvidia
+      /usr/local/cuda/lib64
+    )
+    target_link_libraries(${tgt}
+      pthread nvv4l2 nvbufsurface nvbufsurftransform
+      EGL GLESv2 X11 nvjpeg nvosd drm cuda cudart
+    )
+  endfunction()
+
+  # Автономный тест кодера (синтетика -> H.264-файл).
   add_executable(enc_test
     src/app/enc_test.cpp
     src/encode/h264_encoder.cpp
     ${MMAPI_CLASSES}
   )
-  target_include_directories(enc_test PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${MMAPI}/include
-    ${MMAPI}/include/libjpeg-8b
-    /usr/local/cuda/include
-    /usr/include/aarch64-linux-gnu
-    /usr/include/libdrm
+  camctl_nvenc_target(enc_test)
+
+  # Сквозной поток: камера -> дебайер -> I420 -> NVENC -> RTP/RTSP.
+  add_executable(stream_test
+    src/app/stream_test.cpp
+    src/camera/daheng_camera.cpp
+    src/core/debayer.cpp
+    src/core/rgb_to_i420.cpp
+    src/encode/h264_encoder.cpp
+    src/stream/rtp_sender.cpp
+    src/stream/rtsp_server.cpp
+    ${MMAPI_CLASSES}
   )
-  target_link_directories(enc_test PRIVATE
-    /usr/lib/aarch64-linux-gnu/tegra
-    /usr/lib/aarch64-linux-gnu/nvidia
-    /usr/local/cuda/lib64
-  )
-  target_link_libraries(enc_test
-    pthread nvv4l2 nvbufsurface nvbufsurftransform
-    EGL GLESv2 X11 nvjpeg nvosd drm cuda cudart
-  )
-  message(STATUS "Jetson MMAPI найден — собираю enc_test (NVENC)")
+  camctl_nvenc_target(stream_test)
+  target_link_libraries(stream_test gxiapi)
+
+  message(STATUS "Jetson MMAPI найден — собираю enc_test + stream_test (NVENC)")
 else()
-  message(STATUS "jetson_multimedia_api не найден — enc_test пропущен")
+  message(STATUS "jetson_multimedia_api не найден — enc_test/stream_test пропущены")
 endif()
