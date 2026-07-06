@@ -24,10 +24,13 @@
 
 ## Решение
 
-Кодирование H.264 — **аппаратным NVENC Jetson через V4L2 M2M** (наш код поверх ioctl,
-без сторонних библиотек кодека). Пакетизация — **самописный RTP** (RFC 6184, H.264 в UDP,
-FU-A). Сессия — **минимальный самописный RTSP-сервер** (DESCRIBE/SETUP/PLAY/TEARDOWN).
-Эндпоинт на камеру: `rtsp://<jetson>:8554/<cam>`.
+Кодирование H.264 — **аппаратным NVENC Jetson**. На практике чистый стандартный V4L2 к
+`/dev/v4l2-nvenc` не подходит (нужны NVIDIA-расширения V4L2 и NVMM-буферы `NvBufSurface`),
+поэтому доступ к кодеру — через **`NvVideoEncoder` из `jetson_multimedia_api`** (линкуем
+`libnvv4l2` + `libnvbufsurface`; путь MMAP — memcpy кадра в `NvBuffer`). Это неизбежный
+NVIDIA-слой доступа к железному кодеру (как SDK для камер). Пакетизация — **самописный
+RTP** (RFC 6184, H.264 в UDP, FU-A). Сессия — **минимальный самописный RTSP-сервер**
+(DESCRIBE/SETUP/PLAY/TEARDOWN). Эндпоинт на камеру: `rtsp://<jetson>:8554/<cam>`.
 
 ## Обоснование
 

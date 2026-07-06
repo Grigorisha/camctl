@@ -1,0 +1,32 @@
+---
+description: Never delete files without explicit user approval (especially on remote servers)
+alwaysApply: true
+---
+
+# No deletions without approval
+
+Before deleting, truncating, or overwriting any file or directory — on the local machine **or** on a remote server via SSH — you MUST ask the user first.
+
+## Required workflow
+
+1. Explain what is blocked and why (e.g. disk full, permission error).
+2. Propose specific paths/actions that could help.
+3. Wait for explicit user approval before running `rm`, `apt clean`, cache cleanup, or similar destructive commands.
+
+## Applies to
+
+- Remote servers (`ssh`, `sshpass`, Remote-SSH hosts)
+- Local project files, caches, build artifacts, logs
+- Commands run with `sudo` on any machine
+
+## Do without asking
+
+- Read-only inspection (`ls`, `du`, `df`, `cat`, `grep`)
+- Non-destructive writes the user explicitly requested (e.g. adding an SSH key after they asked to set one up)
+
+## Example
+
+Disk full while setting up SSH keys:
+
+- ✅ Report the problem, show what is using space, ask whether to delete pip cache or free space another way.
+- ❌ Run `rm -rf ~/.cache/pip/*` on the remote host without asking.

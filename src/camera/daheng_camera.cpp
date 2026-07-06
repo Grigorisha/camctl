@@ -59,6 +59,11 @@ bool DahengCamera::open() {
     // Лимит полосы USB (best-effort — есть не на всех моделях).
     GXSetEnumValueByString(h, "DeviceLinkThroughputLimitMode", "On");
     GXSetIntValue(h, "DeviceLinkThroughputLimit", 160000000);
+    // Авто-экспозиция/усиление/баланс белого (best-effort), иначе дефолтный кадр тёмный.
+    GXSetEnumValueByString(h, "ExposureAuto", "Continuous");
+    GXSetFloatValue(h, "AutoExposureTimeMax", 50000.0);  // потолок авто-выдержки (µs) — не роняем FPS
+    GXSetEnumValueByString(h, "GainAuto", "Continuous");
+    GXSetEnumValueByString(h, "BalanceWhiteAuto", "Continuous");
     return true;
 }
 
