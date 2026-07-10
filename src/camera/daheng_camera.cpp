@@ -2,10 +2,12 @@
 
 #include "GXDef.h"
 #include "GxIAPI.h"
+#include "GxIAPILegacy.h"
 #include "GxPixelFormat.h"
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 namespace camctl {
 
@@ -27,6 +29,21 @@ static PixelFormat map_fmt(int64_t gx) {
 DahengCamera::DahengCamera(std::string serial) : serial_(std::move(serial)) {}
 DahengCamera::~DahengCamera() { close(); }
 
+std::vector<DahengCamera::DeviceInfo> DahengCamera::enumerate() {
+    std::vector<DeviceInfo> out;
+    if (GXInitLib() != GX_STATUS_SUCCESS) return out;
+    uint32_t num = 0;
+    if (GXUpdateAllDeviceList(&num, 1000) == GX_STATUS_SUCCESS && num > 0) {
+        std::vector<GX_DEVICE_BASE_INFO> infos(num);
+        size_t size = num * sizeof(GX_DEVICE_BASE_INFO);
+        if (GXGetAllDeviceBaseInfo(infos.data(), &size) == GX_STATUS_SUCCESS) {
+            for (auto& bi : infos) out.push_back({bi.szModelName, bi.szSN});
+        }
+    }
+    GXCloseLib();
+    return out;
+}
+
 bool DahengCamera::open() {
     if (GXInitLib() != GX_STATUS_SUCCESS) {
         std::fprintf(stderr, "GXInitLib failed\n");
@@ -40,11 +57,22 @@ bool DahengCamera::open() {
         return false;
     }
 
-    // TODO: выбор по серийнику (serial_) через GXGetAllDeviceBaseInfo, когда камер >1.
+    // Выбор устройства: по серийнику (две одинаковые Daheng различаем по SN) либо первое.
     GX_DEV_HANDLE h = nullptr;
-    if (GXOpenDeviceByIndex(1, &h) != GX_STATUS_SUCCESS) {
-        std::fprintf(stderr, "Daheng: не удалось открыть устройство\n");
-        return false;
+    if (!serial_.empty()) {
+        GX_OPEN_PARAM op{};
+        op.pszContent = const_cast<char*>(serial_.c_str());
+        op.openMode = GX_OPEN_SN;
+        op.accessMode = GX_ACCESS_CONTROL;
+        if (GXOpenDevice(&op, &h) != GX_STATUS_SUCCESS) {
+            std::fprintf(stderr, "Daheng: не удалось открыть камеру по SN '%s'\n", serial_.c_str());
+            return false;
+        }
+    } else {
+        if (GXOpenDeviceByIndex(1, &h) != GX_STATUS_SUCCESS) {
+            std::fprintf(stderr, "Daheng: не удалось открыть устройство\n");
+            return false;
+        }
     }
     handle_ = h;
 

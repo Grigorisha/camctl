@@ -88,6 +88,19 @@ if(EXISTS ${MMAPI})
   camctl_nvenc_target(camera_service)
   target_link_libraries(camera_service gxiapi)
 
+  # Тепловизор PLUG617R (GuideUSBCamera): собираем в camera_service, только если рядом лежит
+  # libGuideUSBCamera.so (собирается из вендорской .a — см. docs/04-hardware/thermal-usb3-scsdk.md).
+  set(GUIDE_LIB ${CMAKE_SOURCE_DIR}/libGuideUSBCamera.so)
+  if(EXISTS ${GUIDE_LIB})
+    target_sources(camera_service PRIVATE src/camera/thermal_camera.cpp)
+    target_compile_definitions(camera_service PRIVATE CAMCTL_THERMAL)
+    target_include_directories(camera_service PRIVATE ${CMAKE_SOURCE_DIR}/third_party/guide/include)
+    target_link_libraries(camera_service ${GUIDE_LIB})
+    message(STATUS "Guide SDK найден — тепловизор включён в camera_service")
+  else()
+    message(STATUS "libGuideUSBCamera.so не найдена — тепловизор в camera_service отключён")
+  endif()
+
   message(STATUS "Jetson MMAPI найден — собираю enc_test + stream_test + camera_service (NVENC)")
 else()
   message(STATUS "jetson_multimedia_api не найден — enc_test/stream_test пропущены")

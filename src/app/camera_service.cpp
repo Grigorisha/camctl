@@ -5,6 +5,9 @@
 //
 // Запуск:  ./camera_service [serial] [rtsp_port] [ctrl_port] [fps] [maxside]
 #include "camera/daheng_camera.hpp"
+#ifdef CAMCTL_THERMAL
+#include "camera/thermal_camera.hpp"
+#endif
 #include "core/debayer.hpp"
 #include "core/rgb_to_i420.hpp"
 #include "encode/h264_encoder.hpp"
@@ -81,20 +84,59 @@ static void downscale_rgb24(const uint8_t* src, int sw, int sh,
     }
 }
 
+// Описание одного экземпляра камеры (процесс-на-камеру, ADR-0005).
+struct CameraConfig {
+    std::string name = "cam0";
+    std::string type = "daheng";   // "daheng" | "thermal"
+    std::string serial;            // daheng: серийник ("" = первая найденная)
+    std::string device;            // thermal: узел /dev/videoN
+    int rtsp_port = 8554;
+    int ctrl_port = 8555;
+    int fps = 30;
+    int maxside = 1280;
+    std::string preset;            // стартовый пресет
+};
+
+// Прочитать массив камер из config.cameras[] (наш json-модуль).
+static std::vector<CameraConfig> parse_config(const std::string& path, std::string& err) {
+    std::vector<CameraConfig> out;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "не открыть конфиг: " + path; return out; }
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    json::Value root;
+    if (!json::parse(text, root)) { err = "битый JSON конфига"; return out; }
+    const json::Value* cams = root.find("cameras");
+    if (!cams || cams->type != json::Value::Arr) { err = "нет массива cameras[]"; return out; }
+    for (const auto& c : cams->arr) {
+        CameraConfig cc;
+        if (auto* v = c.find("name"))      cc.name = v->as_str(cc.name);
+        if (auto* v = c.find("type"))      cc.type = v->as_str(cc.type);
+        if (auto* v = c.find("serial"))    cc.serial = v->as_str();
+        if (auto* v = c.find("device"))    cc.device = v->as_str();
+        if (auto* v = c.find("rtsp_port")) cc.rtsp_port = (int)v->as_num(cc.rtsp_port);
+        if (auto* v = c.find("ctrl_port")) cc.ctrl_port = (int)v->as_num(cc.ctrl_port);
+        if (auto* v = c.find("fps"))       cc.fps = (int)v->as_num(cc.fps);
+        if (auto* v = c.find("maxside"))   cc.maxside = (int)v->as_num(cc.maxside);
+        if (auto* v = c.find("preset"))    cc.preset = v->as_str();
+        out.push_back(std::move(cc));
+    }
+    return out;
+}
+
 class CameraService {
 public:
-    CameraService(std::string serial, int rtsp_port, int ctrl_port, int fps, int maxside,
-                  std::string startup_preset = "")
-        : cam_(std::move(serial)), rtsp_port_(rtsp_port), ctrl_port_(ctrl_port),
-          maxside_(maxside), startup_preset_(std::move(startup_preset)), enc_fps_(fps) {}
+    explicit CameraService(const CameraConfig& cfg)
+        : cfg_(cfg), rtsp_port_(cfg.rtsp_port), ctrl_port_(cfg.ctrl_port),
+          maxside_(cfg.maxside), startup_preset_(cfg.preset), enc_fps_(cfg.fps) {}
 
     bool init() {
-        if (!cam_.open())  { std::fprintf(stderr, "open() не удался\n"); return false; }
-        std::printf("Камера: %s\n", cam_.info().c_str());
-        if (!cam_.start()) { std::fprintf(stderr, "start() не удался\n"); return false; }
+        if (!make_camera()) return false;
+        if (!cam_->open())  { std::fprintf(stderr, "open() не удался\n"); return false; }
+        std::printf("Камера [%s/%s]: %s\n", cfg_.name.c_str(), cfg_.type.c_str(), cam_->info().c_str());
+        if (!cam_->start()) { std::fprintf(stderr, "start() не удался\n"); return false; }
 
         Frame raw;
-        for (int i = 0; i < 50 && !raw.valid(); ++i) cam_.grab(raw, 500);
+        for (int i = 0; i < 50 && !raw.valid(); ++i) cam_->grab(raw, 500);
         if (!raw.valid()) { std::fprintf(stderr, "нет кадров с камеры\n"); return false; }
         src_w_ = raw.width; src_h_ = raw.height;
 
@@ -109,11 +151,13 @@ public:
         enc_idr_ = enc_fps_;
         enc_bitrate_ = 6000000;
 
-        // Прочитать реальные диапазоны экспозиции/усиления (best-effort).
-        cam_.get_float_range("ExposureTime", exp_lo_, exp_hi_);
-        cam_.get_float_range("Gain", gain_lo_, gain_hi_);
-        cam_.get_float("ExposureTime", exposure_us_);
-        cam_.get_float("Gain", gain_);
+        // Прочитать реальные диапазоны экспозиции/усиления (только Daheng).
+        if (dcam_) {
+            dcam_->get_float_range("ExposureTime", exp_lo_, exp_hi_);
+            dcam_->get_float_range("Gain", gain_lo_, gain_hi_);
+            dcam_->get_float("ExposureTime", exposure_us_);
+            dcam_->get_float("Gain", gain_);
+        }
 
         rtsp_ = std::make_unique<RtspServer>(rtsp_port_, enc_fps_);
         if (!rtsp_->start()) return false;
@@ -155,17 +199,26 @@ public:
               if (need) create_encoder(); }
 
             Frame f;
-            if (!cam_.grab(f, 500)) continue;
+            if (!cam_->grab(f, 500)) continue;
             const int64_t cap_ns = mono_ns();   // метка захвата (host, CLOCK_MONOTONIC)
-            Frame rgb = debayer_to_rgb(f);
-            if (!rgb.valid()) continue;
+
+            // Источник -> RGB24: Bayer через дебайер; RGB24 (тепловизор — уже колормап) как есть.
+            Frame debayered;
+            const Frame* rgb;
+            if (f.format == PixelFormat::RGB24) {
+                rgb = &f;
+            } else {
+                debayered = debayer_to_rgb(f);
+                if (!debayered.valid()) continue;
+                rgb = &debayered;
+            }
 
             int ew, eh;
             { std::lock_guard<std::mutex> lk(mu_); ew = enc_w_; eh = enc_h_; }
 
             scaled.resize(static_cast<size_t>(ew) * eh * 3);
             i420.resize(static_cast<size_t>(ew) * eh * 3 / 2);
-            downscale_rgb24(rgb.data.data(), rgb.width, rgb.height, scaled.data(), ew, eh);
+            downscale_rgb24(rgb->data.data(), rgb->width, rgb->height, scaled.data(), ew, eh);
             rgb24_to_i420(scaled.data(), ew, eh, i420.data());
             if (enc_) {
                 { std::lock_guard<std::mutex> lk(ts_mu_);
@@ -190,11 +243,34 @@ public:
         if (ctrl_) ctrl_->stop();
         if (rtsp_) rtsp_->stop();
         if (enc_)  enc_->finish();
-        cam_.stop();
-        cam_.close();
+        if (cam_) { cam_->stop(); cam_->close(); }
     }
 
 private:
+    // Создать драйвер по типу из конфига. Тепловизор — под флагом сборки (нужен Guide SDK).
+    bool make_camera() {
+        if (cfg_.type == "daheng") {
+            auto d = std::make_unique<DahengCamera>(cfg_.serial);
+            dcam_ = d.get();
+            cam_ = std::move(d);
+            return true;
+        }
+        if (cfg_.type == "thermal") {
+#ifdef CAMCTL_THERMAL
+            auto t = std::make_unique<ThermalCamera>(
+                cfg_.device.empty() ? "/dev/video0" : cfg_.device);
+            tcam_ = t.get();
+            cam_ = std::move(t);
+            return true;
+#else
+            std::fprintf(stderr, "тип 'thermal' не собран (нет Guide SDK)\n");
+            return false;
+#endif
+        }
+        std::fprintf(stderr, "неизвестный тип камеры: '%s'\n", cfg_.type.c_str());
+        return false;
+    }
+
     // --- пересоздание энкодера под текущий enc_* ---
     // ВАЖНО: NVENC — один инстанс; старый уничтожаем ПЕРВЫМ (иначе "resource busy"),
     // и только чистым EOS-остановом (иначе DQ-поток виснет в ioctl).
@@ -235,29 +311,31 @@ private:
     }
 
     void apply_camera_runtime() {
+        if (!dcam_) return;
         double exp, gn; bool ae;
         { std::lock_guard<std::mutex> lk(mu_); exp = exposure_us_; gn = gain_; ae = auto_exp_; }
         if (ae) {
-            cam_.set_enum("ExposureAuto", "Continuous");
+            dcam_->set_enum("ExposureAuto", "Continuous");
         } else {
-            cam_.set_enum("ExposureAuto", "Off");
-            cam_.set_float("ExposureTime", exp);
+            dcam_->set_enum("ExposureAuto", "Off");
+            dcam_->set_float("ExposureTime", exp);
         }
-        cam_.set_enum("GainAuto", "Off");
-        cam_.set_float("Gain", gn);
+        dcam_->set_enum("GainAuto", "Off");
+        dcam_->set_float("Gain", gn);
     }
 
     void apply_decimation() {
+        if (!dcam_) return;
         int d;
         { std::lock_guard<std::mutex> lk(mu_); d = decim_; }
-        cam_.stop();
-        cam_.set_int("DecimationHorizontal", d);
-        cam_.set_int("DecimationVertical", d);
+        dcam_->stop();
+        dcam_->set_int("DecimationHorizontal", d);
+        dcam_->set_int("DecimationVertical", d);
         int64_t w = 0, h = 0;
-        cam_.get_int("Width", w);
-        cam_.get_int("Height", h);
+        dcam_->get_int("Width", w);
+        dcam_->get_int("Height", h);
         { std::lock_guard<std::mutex> lk(mu_); src_w_ = static_cast<int>(w); src_h_ = static_cast<int>(h); }
-        cam_.start();
+        dcam_->start();
         std::printf("Децимация=%d -> сенсор %lldx%lld\n", d, (long long)w, (long long)h);
     }
 
@@ -291,6 +369,9 @@ private:
         add_enc_recreate("enc_width",  &enc_w_,  16, 4096);
         add_enc_recreate("enc_height", &enc_h_,  16, 4096);
         add_enc_recreate("fps",        &enc_fps_, 1,  60);
+
+        // Ручки камеры — только для Daheng (у тепловизора свой набор, добавим отдельно).
+        if (!dcam_) return;
 
         // Камера: экспозиция (µs) — рантайм.
         { ParamInfo pi; pi.name = "exposure_us"; pi.type = "float"; pi.unit = "us";
@@ -334,6 +415,8 @@ private:
     json::Value stats() {
         std::lock_guard<std::mutex> lk(mu_);
         json::Value o = json::Value::O();
+        o.set("name", json::Value::S(cfg_.name));
+        o.set("type", json::Value::S(cfg_.type));
         o.set("fps", json::Value::N(fps_meas_.load()));
         o.set("enc_width", json::Value::N(enc_w_));
         o.set("enc_height", json::Value::N(enc_h_));
@@ -342,6 +425,19 @@ private:
         o.set("src_width", json::Value::N(src_w_));
         o.set("src_height", json::Value::N(src_h_));
         o.set("decimation", json::Value::N(decim_));
+#ifdef CAMCTL_THERMAL
+        if (tcam_) {
+            double hot, cold, cursor, mean;
+            if (tcam_->temps(hot, cold, cursor, mean)) {
+                json::Value t = json::Value::O();
+                t.set("hot", json::Value::N(hot));
+                t.set("cold", json::Value::N(cold));
+                t.set("cursor", json::Value::N(cursor));
+                t.set("mean", json::Value::N(mean));
+                o.set("temps_c", std::move(t));
+            }
+        }
+#endif
         return o;
     }
 
@@ -399,7 +495,12 @@ private:
         return arr;
     }
 
-    DahengCamera cam_;
+    CameraConfig cfg_;
+    std::unique_ptr<ICamera> cam_;
+    DahengCamera* dcam_ = nullptr;   // алиас cam_, когда тип daheng (доступ к GenICam-ручкам)
+#ifdef CAMCTL_THERMAL
+    ThermalCamera* tcam_ = nullptr;  // алиас cam_, когда тип thermal (доступ к температурам)
+#endif
     std::unique_ptr<H264Encoder> enc_;
     std::unique_ptr<RtspServer> rtsp_;
     std::unique_ptr<ControlServer> ctrl_;
@@ -427,19 +528,69 @@ private:
     std::deque<int64_t> ts_fifo_;
 };
 
+static void usage() {
+    std::printf(
+        "camera_service — сервис одной камеры (процесс-на-камеру, ADR-0005)\n"
+        "  camera_service --list-cameras                 перечислить подключённые Daheng (серийники)\n"
+        "  camera_service --config <file> --list         показать камеры из конфига\n"
+        "  camera_service --config <file> --name <cam>   запустить камеру из конфига\n"
+        "  camera_service [serial] [rtsp] [ctrl] [fps] [maxside] [preset]   (Daheng, без конфига)\n");
+}
+
 int main(int argc, char** argv) {
-    const std::string serial = (argc > 1) ? argv[1] : "";
-    const int rtsp_port = (argc > 2) ? std::atoi(argv[2]) : 8554;
-    const int ctrl_port = (argc > 3) ? std::atoi(argv[3]) : 8555;
-    const int fps       = (argc > 4) ? std::atoi(argv[4]) : 30;
-    const int maxside   = (argc > 5) ? std::atoi(argv[5]) : 1280;
-    const std::string preset = (argc > 6) ? argv[6] : "";  // стартовый пресет (имя без .json)
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::vector<std::string> args(argv + 1, argv + argc);
+    auto has = [&](const std::string& fl) { return std::find(args.begin(), args.end(), fl) != args.end(); };
+    auto opt = [&](const std::string& fl) -> std::string {
+        auto it = std::find(args.begin(), args.end(), fl);
+        return (it != args.end() && std::next(it) != args.end()) ? *std::next(it) : std::string();
+    };
+
+    if (has("-h") || has("--help")) { usage(); return 0; }
+
+    // Перечисление физических камер (FR-01).
+    if (has("--list-cameras")) {
+        auto devs = DahengCamera::enumerate();
+        std::printf("Найдено Daheng: %zu\n", devs.size());
+        for (auto& d : devs) std::printf("  model=%-20s serial=%s\n", d.model.c_str(), d.serial.c_str());
+        return 0;
+    }
+
+    CameraConfig cfg;
+    const std::string cfg_path = opt("--config");
+    if (!cfg_path.empty()) {
+        std::string err;
+        auto cams = parse_config(cfg_path, err);
+        if (!err.empty()) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (has("--list")) {
+            std::printf("Камеры в %s:\n", cfg_path.c_str());
+            for (auto& c : cams)
+                std::printf("  %-8s type=%-8s %-14s rtsp:%d ctrl:%d preset:%s\n",
+                            c.name.c_str(), c.type.c_str(),
+                            (c.serial.empty() ? c.device : c.serial).c_str(),
+                            c.rtsp_port, c.ctrl_port, c.preset.empty() ? "-" : c.preset.c_str());
+            return 0;
+        }
+        const std::string name = opt("--name");
+        if (name.empty()) { std::fprintf(stderr, "укажите --name <камера> (или --list)\n"); return 1; }
+        bool found = false;
+        for (auto& c : cams) if (c.name == name) { cfg = c; found = true; break; }
+        if (!found) { std::fprintf(stderr, "камера '%s' не найдена в конфиге\n", name.c_str()); return 1; }
+    } else {
+        // Позиционные аргументы (обратная совместимость): Daheng.
+        cfg.type = "daheng";
+        if (argc > 1) cfg.serial    = argv[1];
+        if (argc > 2) cfg.rtsp_port = std::atoi(argv[2]);
+        if (argc > 3) cfg.ctrl_port = std::atoi(argv[3]);
+        if (argc > 4) cfg.fps       = std::atoi(argv[4]);
+        if (argc > 5) cfg.maxside   = std::atoi(argv[5]);
+        if (argc > 6) cfg.preset    = argv[6];
+    }
 
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
-    setvbuf(stdout, nullptr, _IOLBF, 0);  // построчный вывод — логи видны сразу по ssh
 
-    CameraService svc(serial, rtsp_port, ctrl_port, fps, maxside, preset);
+    CameraService svc(cfg);
     if (!svc.init()) return 1;
     svc.run();
     std::printf("\nОстановка...\n");

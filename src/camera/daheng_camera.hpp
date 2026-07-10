@@ -3,6 +3,7 @@
 // формат Байера определяется из кадра, не хардкодится.
 #include "camera/icamera.hpp"
 #include <string>
+#include <vector>
 
 namespace camctl {
 
@@ -10,6 +11,10 @@ class DahengCamera : public ICamera {
 public:
     explicit DahengCamera(std::string serial = "");  // пустой = первая найденная
     ~DahengCamera() override;
+
+    // Перечисление подключённых Daheng (FR-01). Две камеры с одним VID:PID различаем по серийнику.
+    struct DeviceInfo { std::string model; std::string serial; };
+    static std::vector<DeviceInfo> enumerate();
 
     bool open() override;
     bool start() override;

@@ -1,0 +1,35 @@
+{
+  "_note": "Целевая конфигурация: 2x Daheng NS-301UCL (стереопара) + PLUG617R (тепловизор). Серийники Daheng заполнить из 'camera_service --list-cameras'. cam0 serial='' = первая найденная (годится для одиночной камеры/теста; для стереопары ОБЕ должны иметь явные серийники).",
+  "cameras": [
+    {
+      "name": "cam0",
+      "type": "daheng",
+      "serial": "",
+      "rtsp_port": 8554,
+      "ctrl_port": 8555,
+      "fps": 30,
+      "maxside": 1280,
+      "preset": ""
+    },
+    {
+      "name": "cam1",
+      "type": "daheng",
+      "serial": "ЗАМЕНИТЬ-НА-SN-ПРАВОЙ",
+      "rtsp_port": 8556,
+      "ctrl_port": 8557,
+      "fps": 30,
+      "maxside": 1280,
+      "preset": ""
+    },
+    {
+      "name": "thermal",
+      "type": "thermal",
+      "device": "/dev/video0",
+      "rtsp_port": 8558,
+      "ctrl_port": 8559,
+      "fps": 25,
+      "maxside": 640,
+      "preset": ""
+    }
+  ]
+}
