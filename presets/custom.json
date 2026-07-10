@@ -1,0 +1,9 @@
+{
+  "auto_exposure": true,
+  "gain": 0.0,
+  "decimation": 1,
+  "enc_width": 1280,
+  "enc_height": 1280,
+  "fps": 30,
+  "bitrate": 6000000
+}

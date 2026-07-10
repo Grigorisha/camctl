@@ -19,7 +19,12 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <deque>
+#include <dirent.h>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,6 +34,37 @@ using namespace camctl;
 
 static std::atomic<bool> g_run{true};
 static void on_sig(int) { g_run = false; }
+
+// CLOCK_MONOTONIC (не CLOCK_REALTIME!): реальные часы Jetson шагает NTP, из-за чего
+// кросс-машинный замер задержки ломается. Монотонные часы стабильны, а произвольная
+// точка отсчёта сокращается при обмене смещением по control-каналу.
+static int64_t mono_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+// Собрать SEI-NAL (Annex-B) с меткой захвата: user_data_unregistered (payloadType=5),
+// 16-байтный UUID (ASCII, без нулей — легко искать во вьюере) + 8 байт ts (big-endian, ns).
+// С emulation-prevention (вставка 0x03 после 00 00), как требует H.264.
+static std::vector<uint8_t> build_sei_annexb(int64_t ts_ns) {
+    static const uint8_t uuid[16] = {'C','A','M','C','T','L','-','T','S','-','0','0','0','1','!','!'};
+    std::vector<uint8_t> rbsp;
+    rbsp.push_back(0x05);                 // payloadType = user_data_unregistered
+    rbsp.push_back(24);                   // payloadSize = 16 (uuid) + 8 (ts)
+    for (int i = 0; i < 16; ++i) rbsp.push_back(uuid[i]);
+    for (int i = 7; i >= 0; --i) rbsp.push_back(static_cast<uint8_t>((ts_ns >> (i * 8)) & 0xFF));
+    rbsp.push_back(0x80);                 // rbsp_trailing_bits
+
+    std::vector<uint8_t> out = {0, 0, 0, 1, 0x06};  // старт-код + NAL header (type 6 = SEI)
+    int zeros = 0;
+    for (uint8_t b : rbsp) {
+        if (zeros >= 2 && b <= 3) { out.push_back(0x03); zeros = 0; }
+        out.push_back(b);
+        zeros = (b == 0) ? zeros + 1 : 0;
+    }
+    return out;
+}
 
 static void downscale_rgb24(const uint8_t* src, int sw, int sh,
                             uint8_t* dst, int dw, int dh) {
@@ -47,9 +83,10 @@ static void downscale_rgb24(const uint8_t* src, int sw, int sh,
 
 class CameraService {
 public:
-    CameraService(std::string serial, int rtsp_port, int ctrl_port, int fps, int maxside)
+    CameraService(std::string serial, int rtsp_port, int ctrl_port, int fps, int maxside,
+                  std::string startup_preset = "")
         : cam_(std::move(serial)), rtsp_port_(rtsp_port), ctrl_port_(ctrl_port),
-          enc_fps_(fps), maxside_(maxside) {}
+          maxside_(maxside), startup_preset_(std::move(startup_preset)), enc_fps_(fps) {}
 
     bool init() {
         if (!cam_.open())  { std::fprintf(stderr, "open() не удался\n"); return false; }
@@ -89,10 +126,20 @@ public:
             ctrl_port_, &reg_,
             [this] { return stats(); },
             [this](const std::string& n, std::string& e) { return load_preset(n, e); });
+        ctrl_->set_save_handler([this](const std::string& n, std::string& e) { return save_preset(n, e); });
+        ctrl_->set_list_handler([this] { return list_presets(); });
         if (!ctrl_->start()) return false;
 
-        std::printf("Готово. rtsp://<host>:%d/cam0  |  control tcp://<host>:%d\n",
-                    rtsp_port_, ctrl_port_);
+        // Стартовый пресет (значения по умолчанию по имени) — если задан.
+        if (!startup_preset_.empty()) {
+            std::string e;
+            if (!load_preset(startup_preset_, e))
+                std::fprintf(stderr, "стартовый пресет '%s': %s\n", startup_preset_.c_str(), e.c_str());
+        }
+
+        std::printf("Готово. rtsp://<host>:%d/cam0  |  control tcp://<host>:%d  |  пресеты: %s/\n",
+                    rtsp_port_, ctrl_port_, presets_dir_.c_str());
+        std::fflush(stdout);
         return true;
     }
 
@@ -103,9 +150,13 @@ public:
 
         while (g_run) {
             drain_tasks();
+            // Пересоздание энкодера (коалесцированное) — в потоке цикла, без гонок с encodeFrame.
+            { bool need; { std::lock_guard<std::mutex> lk(mu_); need = enc_dirty_; enc_dirty_ = false; }
+              if (need) create_encoder(); }
 
             Frame f;
             if (!cam_.grab(f, 500)) continue;
+            const int64_t cap_ns = mono_ns();   // метка захвата (host, CLOCK_MONOTONIC)
             Frame rgb = debayer_to_rgb(f);
             if (!rgb.valid()) continue;
 
@@ -116,7 +167,12 @@ public:
             i420.resize(static_cast<size_t>(ew) * eh * 3 / 2);
             downscale_rgb24(rgb.data.data(), rgb.width, rgb.height, scaled.data(), ew, eh);
             rgb24_to_i420(scaled.data(), ew, eh, i420.data());
-            if (enc_) enc_->encodeFrame(i420.data(), i420.size());
+            if (enc_) {
+                { std::lock_guard<std::mutex> lk(ts_mu_);
+                  ts_fifo_.push_back(cap_ns);
+                  while (ts_fifo_.size() > 10) ts_fifo_.pop_front(); }  // защита от рассинхрона
+                enc_->encodeFrame(i420.data(), i420.size());
+            }
 
             // Замер FPS раз в ~1с.
             ++frames_in_window;
@@ -147,9 +203,19 @@ private:
         { std::lock_guard<std::mutex> lk(mu_);
           w = enc_w_; h = enc_h_; fps = enc_fps_; br = enc_bitrate_; }
         enc_.reset();  // чистый останов + освобождение старого до создания нового
+        { std::lock_guard<std::mutex> lk(ts_mu_); ts_fifo_.clear(); }  // метки старого энкодера не валидны
         auto e = std::make_unique<H264Encoder>();
         if (!e->init(w, h, fps, br)) { std::fprintf(stderr, "encoder init %dx%d failed\n", w, h); return false; }
-        e->on_nal([this](const uint8_t* d, size_t n, bool key) { rtsp_->push_au(d, n, key); });
+        // on_nal: достаём метку захвата этого кадра (FIFO) и вставляем SEI перед access unit.
+        e->on_nal([this](const uint8_t* d, size_t n, bool key) {
+            int64_t cap;
+            { std::lock_guard<std::mutex> lk(ts_mu_);
+              if (!ts_fifo_.empty()) { cap = ts_fifo_.front(); ts_fifo_.pop_front(); }
+              else cap = mono_ns(); }
+            std::vector<uint8_t> sei = build_sei_annexb(cap);
+            sei.insert(sei.end(), d, d + n);          // SEI + access unit одним буфером
+            rtsp_->push_au(sei.data(), sei.size(), key);
+        });
         e->request_keyframe();
         enc_ = std::move(e);
         std::printf("Энкодер пересоздан: %dx%d @ %d fps, %d bps\n", w, h, fps, br);
@@ -279,11 +345,58 @@ private:
         return o;
     }
 
+    // --- пресеты (JSON-файлы presets/<name>.json) ---
+    // Файл — плоский объект {имя_ручки: значение}. Применяется через тот же путь reg_.set,
+    // поэтому reconfig/задачи отрабатывают штатно.
     bool load_preset(const std::string& name, std::string& err) {
-        // Пресеты подключим файлами позже; пока — заглушка с известными именами.
-        (void)name;
-        err = "presets not implemented yet";
-        return false;
+        const std::string path = presets_dir_ + "/" + name + ".json";
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { err = "пресет не найден: " + path; return false; }
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        json::Value v;
+        if (!json::parse(text, v) || v.type != json::Value::Obj) { err = "битый JSON пресета"; return false; }
+
+        int applied = 0;
+        std::string errs;
+        for (const auto& kv : v.obj) {
+            std::string e;
+            if (reg_.set(kv.first, kv.second, e)) ++applied;
+            else errs += kv.first + ": " + e + "; ";
+        }
+        std::printf("Пресет '%s': применено %d параметров%s\n", name.c_str(), applied,
+                    errs.empty() ? "" : ("; пропущено: " + errs).c_str());
+        std::fflush(stdout);
+        if (applied == 0) { err = errs.empty() ? "пустой пресет" : errs; return false; }
+        return true;
+    }
+
+    bool save_preset(const std::string& name, std::string& err) {
+        json::Value obj = json::Value::O();
+        for (const auto& p : reg_.list().arr) {           // текущие значения всех ручек
+            const json::Value* nm = p.find("name");
+            const json::Value* val = p.find("value");
+            if (nm && val) obj.set(nm->as_str(), *val);
+        }
+        const std::string path = presets_dir_ + "/" + name + ".json";
+        std::ofstream f(path, std::ios::binary);
+        if (!f) { err = "не могу записать " + path; return false; }
+        f << json::dump(obj) << "\n";
+        std::printf("Пресет '%s' сохранён в %s\n", name.c_str(), path.c_str());
+        std::fflush(stdout);
+        return true;
+    }
+
+    json::Value list_presets() {
+        json::Value arr = json::Value::A();
+        if (DIR* d = opendir(presets_dir_.c_str())) {
+            while (struct dirent* e = readdir(d)) {
+                std::string fn = e->d_name;
+                if (fn.size() > 5 && fn.substr(fn.size() - 5) == ".json")
+                    arr.arr.push_back(json::Value::S(fn.substr(0, fn.size() - 5)));
+            }
+            closedir(d);
+        }
+        return arr;
     }
 
     DahengCamera cam_;
@@ -294,10 +407,13 @@ private:
 
     int rtsp_port_, ctrl_port_;
     int maxside_;
+    std::string presets_dir_ = "presets";
+    std::string startup_preset_;
 
     std::mutex mu_;            // защищает конфиг ниже
     int src_w_ = 0, src_h_ = 0;
     int enc_w_ = 0, enc_h_ = 0, enc_fps_ = 30, enc_idr_ = 30, enc_bitrate_ = 6000000;
+    bool enc_dirty_ = false;   // требуется пересоздание энкодера (коалесцирование width/height/fps)
     double exposure_us_ = 10000, gain_ = 0;
     bool auto_exp_ = true;
     int decim_ = 1;
@@ -306,6 +422,9 @@ private:
     std::mutex task_mu_;
     std::vector<std::function<void()>> tasks_;
     std::atomic<double> fps_meas_{0};
+
+    std::mutex ts_mu_;                  // FIFO меток захвата (loop-поток пишет, DQ-поток читает)
+    std::deque<int64_t> ts_fifo_;
 };
 
 int main(int argc, char** argv) {
@@ -314,11 +433,13 @@ int main(int argc, char** argv) {
     const int ctrl_port = (argc > 3) ? std::atoi(argv[3]) : 8555;
     const int fps       = (argc > 4) ? std::atoi(argv[4]) : 30;
     const int maxside   = (argc > 5) ? std::atoi(argv[5]) : 1280;
+    const std::string preset = (argc > 6) ? argv[6] : "";  // стартовый пресет (имя без .json)
 
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
+    setvbuf(stdout, nullptr, _IOLBF, 0);  // построчный вывод — логи видны сразу по ssh
 
-    CameraService svc(serial, rtsp_port, ctrl_port, fps, maxside);
+    CameraService svc(serial, rtsp_port, ctrl_port, fps, maxside, preset);
     if (!svc.init()) return 1;
     svc.run();
     std::printf("\nОстановка...\n");

@@ -3,16 +3,20 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
+#include <cerrno>
 #include <ctime>
 
 namespace camctl {
 
-static int64_t wall_ns() {
+// CLOCK_MONOTONIC — тот же источник, что и SEI-метка захвата в camera_service.
+// Реальные часы Jetson шагает NTP, поэтому для замера задержки они непригодны.
+static int64_t mono_ns() {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
@@ -57,6 +61,9 @@ void ControlServer::accept_loop() {
         if (cfd < 0) { if (running_) continue; else break; }
         int one = 1;
         ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        // recv-таймаут, чтобы поток периодически проверял running_ и не висел в stop().
+        timeval tv{0, 500000};
+        ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         client_threads_.emplace_back(&ControlServer::client_loop, this, cfd);
     }
 }
@@ -68,6 +75,10 @@ void ControlServer::client_loop(int cfd) {
         size_t nl;
         while ((nl = buf.find('\n')) == std::string::npos) {
             ssize_t n = ::recv(cfd, tmp, sizeof(tmp), 0);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!running_) { ::close(cfd); return; }
+                continue;  // таймаут — просто перепроверили running_
+            }
             if (n <= 0) { ::close(cfd); return; }
             buf.append(tmp, static_cast<size_t>(n));
         }
@@ -88,7 +99,7 @@ void ControlServer::client_loop(int cfd) {
 }
 
 std::string ControlServer::handle_request(const std::string& line) {
-    const int64_t t_recv = wall_ns();  // для команды time
+    const int64_t t_recv = mono_ns();  // для команды time
 
     json::Value req;
     json::Value out = json::Value::O();
@@ -147,13 +158,26 @@ std::string ControlServer::handle_request(const std::string& line) {
         out.set("ok", json::Value::B(true));
         return json::dump(out);
     }
+    if (cmd == "save_preset") {
+        const json::Value* n = req.find("name");
+        if (!n) return fail("missing name");
+        std::string err;
+        if (!save_ || !save_(n->as_str(), err)) return fail(err.empty() ? "save failed" : err);
+        out.set("ok", json::Value::B(true));
+        return json::dump(out);
+    }
+    if (cmd == "list_presets") {
+        out.set("ok", json::Value::B(true));
+        out.set("presets", list_presets_ ? list_presets_() : json::Value::A());
+        return json::dump(out);
+    }
     if (cmd == "time") {
         // Обмен часами (SNTP-подобно): клиент шлёт t1, мы возвращаем t2(recv) и t3(send).
         const json::Value* t1 = req.find("t1");
         out.set("ok", json::Value::B(true));
         if (t1) out.set("t1", *t1);
         out.set("t2", json::Value::N(static_cast<double>(t_recv)));
-        out.set("t3", json::Value::N(static_cast<double>(wall_ns())));
+        out.set("t3", json::Value::N(static_cast<double>(mono_ns())));
         return json::dump(out);
     }
     return fail("unknown cmd: " + cmd);

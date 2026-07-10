@@ -7,9 +7,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/time.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <sstream>
 #include <map>
 
@@ -141,6 +143,9 @@ void RtspServer::accept_loop() {
         if (cfd < 0) { if (running_) continue; else break; }
         int one = 1;
         ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        // recv-таймаут, чтобы поток периодически проверял running_ и не висел в stop().
+        timeval tv{0, 500000};
+        ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         client_threads_.emplace_back(&RtspServer::client_loop, this, cfd);
     }
 }
@@ -164,6 +169,10 @@ void RtspServer::client_loop(int cfd) {
         size_t hdr_end;
         while ((hdr_end = buf.find("\r\n\r\n")) == std::string::npos) {
             ssize_t n = ::recv(cfd, tmp, sizeof(tmp), 0);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!running_) goto done;
+                continue;  // таймаут — перепроверили running_
+            }
             if (n <= 0) goto done;
             buf.append(tmp, static_cast<size_t>(n));
         }
