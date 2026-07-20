@@ -21,7 +21,7 @@
 | [06-research/](06-research/) | Исследования и эксперименты |
 | [07-journal/](07-journal/) | Дневник разработки (по датам) |
 | [08-testing/](08-testing/) | Стратегия тестирования и тест-кейсы |
-| [09-operations/](09-operations/) | Развёртывание и эксплуатация |
+| [09-operations/](09-operations/) | Развёртывание и эксплуатация — актуальный юзергайд: [09-operations/user-guide.md](09-operations/user-guide.md) |
 | [10-reference/](10-reference/) | Внешние ссылки и реестр рисков |
 
 ---

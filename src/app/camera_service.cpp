@@ -366,16 +366,44 @@ private:
                   enc_dirty_ = true;
                   return true; });
         };
-        add_enc_recreate("enc_width",  &enc_w_,  16, 4096);
-        add_enc_recreate("enc_height", &enc_h_,  16, 4096);
+        // Нижняя граница разрешения поднята с формального минимума NVENC (16) до практически
+        // осмысленного кадра — иначе слайдер в клиентской панели можно утащить в вырожденные
+        // 16x16 и получить нерабочий поток.
+        add_enc_recreate("enc_width",  &enc_w_,  160, 4096);
+        add_enc_recreate("enc_height", &enc_h_,  160, 4096);
         add_enc_recreate("fps",        &enc_fps_, 1,  60);
 
-        // Ручки камеры — только для Daheng (у тепловизора свой набор, добавим отдельно).
+#ifdef CAMCTL_THERMAL
+        // Тепловизор: цветовая палитра превью — рантайм (следующий кадр из SDK-коллбэка).
+        if (tcam_) {
+            ParamInfo pi; pi.name = "palette"; pi.type = "enum";
+            pi.options = ThermalCamera::paletteNames();
+            reg_.add(pi,
+              [this] { return V::S(ThermalCamera::paletteNames()[(size_t)tcam_->getPalette()]); },
+              [this](const V& v, std::string& err) {
+                  const auto& names = ThermalCamera::paletteNames();
+                  const std::string s = v.as_str();
+                  auto it = std::find(names.begin(), names.end(), s);
+                  if (it == names.end()) { err = "unknown palette: " + s; return false; }
+                  tcam_->setPalette(static_cast<ThermalPalette>(std::distance(names.begin(), it)));
+                  return true; });
+        }
+#endif
+
+        // Ручки камеры — только для Daheng (у тепловизора свой набор, добавлен выше).
         if (!dcam_) return;
 
         // Камера: экспозиция (µs) — рантайм.
+        // Потолок урезан относительно «сырого» максимума GenICam-диапазона (у некоторых
+        // сенсоров — до 1с): выдержка длиннее кадрового периода тянет эффективный FPS вниз
+        // пропорционально и на глаз выглядит как «сломанный» поток. 200мс — компромисс:
+        // слабый свет всё ещё вытягивается, но эффективный FPS не проваливается ниже ~5.
+        static constexpr double kMaxSafeExposureUs = 200000.0;
         { ParamInfo pi; pi.name = "exposure_us"; pi.type = "float"; pi.unit = "us";
-          if (exp_hi_ > exp_lo_) { pi.has_range = true; pi.min = exp_lo_; pi.max = exp_hi_; }
+          if (exp_hi_ > exp_lo_) {
+              pi.has_range = true; pi.min = exp_lo_;
+              pi.max = std::min(exp_hi_, kMaxSafeExposureUs);
+          }
           reg_.add(pi,
             [this] { std::lock_guard<std::mutex> lk(mu_); return V::N(exposure_us_); },
             [this](const V& v, std::string&) {

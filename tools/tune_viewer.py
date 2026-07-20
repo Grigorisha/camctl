@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """camctl — вьюер для подбора параметров (dev-инструмент, НЕ релиз).
 
-Показывает поток rtsp:// с оверлеем FPS и сквозной задержки (glass-to-glass) и
-позволяет горячими клавишами менять битрейт/разрешение/децимацию через control-канал.
+Показывает поток rtsp:// с оверлеем FPS и сквозной задержки (glass-to-glass), горячими
+клавишами и панелью параметров (справа) — панель строится автоматически по get_params,
+так что показывает ровно те ручки, что реально поддерживает камера (у Daheng — экспозиция/
+усиление/децимация, у тепловизора — палитра и т.п.), без хардкода под конкретный тип.
 
 Задержка меряется по SEI-метке захвата, вложенной сервисом в каждый кадр, с поправкой
 на смещение часов Jetson↔ПК (обмен по control-каналу, SNTP-подобно).
@@ -10,8 +12,8 @@
   GUI:       python3 tools/tune_viewer.py [host] [rtsp_port] [ctrl_port]
   Проверка:  python3 tools/tune_viewer.py [host] [rtsp_port] [ctrl_port] --headless [sec]
 
-Горячие клавиши (GUI): ↑/↓ битрейт ±1Мбит | 1/2/3/4 разрешение 480/640/960/1280 |
-                       d децимация 1↔2 | e авто-экспозиция вкл/выкл | q выход
+Горячие клавиши (GUI, на видео): ↑/↓ битрейт ±1Мбит | 1/2/3/4 разрешение 480/640/960/1280 |
+                                 d децимация 1↔2 | e авто-экспозиция вкл/выкл | q выход
 """
 import sys, socket, json, time, threading, collections
 import av
@@ -176,8 +178,8 @@ def run_gui(host, rtsp_port, ctrl_port):
 
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("camctl tune viewer")
-            self.setMinimumSize(640, 640)
+            self.setFocusPolicy(QtCore.Qt.StrongFocus)
+            self.setMinimumSize(480, 480)
             self.setAlignment(QtCore.Qt.AlignCenter)
             self.setStyleSheet("background:#111;")
             self.stats = {}
@@ -234,15 +236,148 @@ def run_gui(host, rtsp_port, ctrl_port):
             elif k == QtCore.Qt.Key_E:
                 ctrl.set("auto_exposure", not s.get("auto_exposure", True))
 
+    class SettingsPanel(QtWidgets.QWidget):
+        """Панель ручек камеры, построенная автоматически по get_params (без хардкода типа камеры)."""
+        def __init__(self, ctrl):
+            super().__init__()
+            self.ctrl = ctrl
+            self._suspend = False   # не слать set() при программном обновлении виджетов
+            self._rows = {}         # name -> (kind, widget, extra)
+
+            outer = QtWidgets.QVBoxLayout(self)
+            title = QtWidgets.QLabel("Параметры камеры")
+            title.setStyleSheet("font-weight:bold;")
+            outer.addWidget(title)
+
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            inner = QtWidgets.QWidget()
+            self.form = QtWidgets.QFormLayout(inner)
+            scroll.setWidget(inner)
+            outer.addWidget(scroll)
+
+            self._build()
+            self.timer = QtCore.QTimer(self)
+            self.timer.timeout.connect(self.refresh_values)
+            self.timer.start(1500)
+
+        def _fetch_params(self):
+            try:
+                return self.ctrl.rpc({"cmd": "get_params"}).get("params", [])
+            except Exception:
+                return []
+
+        def _build(self):
+            params = self._fetch_params()
+            if not params:
+                self.form.addRow(QtWidgets.QLabel("нет связи с камерой"))
+                return
+            for p in params:
+                name, typ = p["name"], p["type"]
+                label = name + (f" ({p['unit']})" if p.get("unit") else "")
+                if typ == "bool":
+                    w = QtWidgets.QCheckBox()
+                    w.toggled.connect(lambda val, n=name: self._set(n, val))
+                    self.form.addRow(label, w)
+                    self._rows[name] = ("bool", w, None)
+                elif typ == "enum":
+                    w = QtWidgets.QComboBox()
+                    w.addItems(p.get("options", []))
+                    w.currentTextChanged.connect(lambda val, n=name: self._set(n, val))
+                    self.form.addRow(label, w)
+                    self._rows[name] = ("enum", w, None)
+                elif p.get("min") is not None and p.get("max") is not None:
+                    self._rows[name] = ("num_slider", *self._add_slider(label, name, typ, p["min"], p["max"]))
+                else:
+                    spin = QtWidgets.QDoubleSpinBox()
+                    spin.setRange(-1e9, 1e9)
+                    spin.setDecimals(0 if typ == "int" else 3)
+                    spin.editingFinished.connect(lambda n=name, sp=spin: self._set(n, sp.value()))
+                    self.form.addRow(label, spin)
+                    self._rows[name] = ("num_spin", spin, None)
+            self.refresh_values()
+
+        def _add_slider(self, label, name, typ, lo, hi):
+            row = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout(row); hl.setContentsMargins(0, 0, 0, 0)
+            slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            slider.setRange(0, 1000)
+            vlabel = QtWidgets.QLabel(""); vlabel.setMinimumWidth(70)
+            hl.addWidget(slider, 1); hl.addWidget(vlabel)
+            self.form.addRow(label, row)
+
+            def to_value(pos):
+                v = lo + (hi - lo) * (pos / 1000.0)
+                return int(round(v)) if typ == "int" else round(v, 3)
+
+            def to_pos(val):
+                return int(round((val - lo) / (hi - lo) * 1000)) if hi > lo else 0
+
+            slider.valueChanged.connect(lambda pos: vlabel.setText(str(to_value(pos))))
+            slider.sliderReleased.connect(lambda: self._set(name, to_value(slider.value())))
+            return slider, (vlabel, to_value, to_pos)
+
+        def _set(self, name, value):
+            if self._suspend:
+                return
+            r = self.ctrl.set(name, value)
+            if not r.get("ok"):
+                print(f"set {name}={value}: {r.get('error')}")
+
+        def refresh_values(self):
+            params = self._fetch_params()
+            if not params:
+                return
+            self._suspend = True
+            try:
+                for p in params:
+                    row = self._rows.get(p["name"])
+                    if not row:
+                        continue
+                    kind, w, extra = row
+                    if kind == "bool":
+                        w.setChecked(bool(p["value"]))
+                    elif kind == "enum":
+                        i = w.findText(str(p["value"]))
+                        if i >= 0:
+                            w.setCurrentIndex(i)
+                    elif kind == "num_slider":
+                        vlabel, to_value, to_pos = extra
+                        if not w.isSliderDown():
+                            w.setValue(to_pos(p["value"]))
+                        vlabel.setText(str(p["value"]))
+                    elif kind == "num_spin":
+                        if not w.hasFocus():
+                            w.setValue(p["value"])
+            finally:
+                self._suspend = False
+
+    class MainWindow(QtWidgets.QWidget):
+        def __init__(self, viewer, panel, dec):
+            super().__init__()
+            self.setWindowTitle("camctl tune viewer")
+            self.viewer, self.dec = viewer, dec
+            lay = QtWidgets.QHBoxLayout(self)
+            lay.addWidget(viewer, 1)
+            panel.setFixedWidth(300)
+            lay.addWidget(panel)
+
+        def keyPressEvent(self, e):
+            self.viewer.keyPressEvent(e)  # хоткеи работают, даже если фокус ушёл на панель
+
         def closeEvent(self, e):
-            self.dec.stop(); e.accept()
+            self.dec.stop()
+            e.accept()
 
     app = QtWidgets.QApplication(sys.argv)
-    v = Viewer()
-    v.dec = Decoder(f"rtsp://{host}:{rtsp_port}/cam0", ctrl,
-                    lambda fr, fps, lat: v.frame_sig.emit(fr, fps, lat))
-    v.dec.start()
-    v.resize(900, 900); v.show()
+    viewer = Viewer()
+    panel = SettingsPanel(ctrl)
+    dec = Decoder(f"rtsp://{host}:{rtsp_port}/cam0", ctrl,
+                  lambda fr, fps, lat: viewer.frame_sig.emit(fr, fps, lat))
+    win = MainWindow(viewer, panel, dec)
+    dec.start()
+    win.resize(1200, 900); win.show()
+    viewer.setFocus()
     sys.exit(app.exec())
 
 

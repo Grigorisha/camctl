@@ -8,7 +8,8 @@
 
 > Текущий код на Python (`viewer_qt.py`, `guide_thermal.py`, `Test.py`) — **прототип** для
 > проверки камер. Релиз пишется на **C++** ([ADR-0003](../02-architecture/decisions/0003-service-language-cpp.md));
-> инструкции ниже относятся к прототипу.
+> инструкции ниже относятся к прототипу. Для деплоя и эксплуатации текущего
+> C++-релиза (`camera_service` + клиент) см. **[user-guide.md](user-guide.md)**.
 
 ## Окружение
 

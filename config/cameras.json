@@ -4,7 +4,7 @@
     {
       "name": "cam0",
       "type": "daheng",
-      "serial": "",
+      "serial": "FCN25010025",
       "rtsp_port": 8554,
       "ctrl_port": 8555,
       "fps": 30,
@@ -14,7 +14,7 @@
     {
       "name": "cam1",
       "type": "daheng",
-      "serial": "ЗАМЕНИТЬ-НА-SN-ПРАВОЙ",
+      "serial": "FCN25010026",
       "rtsp_port": 8556,
       "ctrl_port": 8557,
       "fps": 30,

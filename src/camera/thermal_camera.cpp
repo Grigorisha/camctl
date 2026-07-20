@@ -2,6 +2,9 @@
 
 #include "guideusbcamera.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -14,6 +17,59 @@ namespace camctl {
 // Индексы температур в param-строке (как в probe разработчиков), значение/10 = °C.
 static constexpr int kHot = 46, kCold = 49, kCursor = 52, kMean = 53;
 
+namespace {
+
+using Lut256 = std::array<std::array<uint8_t, 3>, 256>;
+struct Stop { int pos; uint8_t r, g, b; };
+
+// Линейная интерполяция между опорными точками (pos возрастает, 0..255).
+Lut256 build_lut(const std::vector<Stop>& stops) {
+    Lut256 lut{};
+    for (int i = 0; i < 256; ++i) {
+        size_t j = 0;
+        while (j + 1 < stops.size() && stops[j + 1].pos < i) ++j;
+        const Stop& a = stops[j];
+        const Stop& b = (j + 1 < stops.size()) ? stops[j + 1] : stops[j];
+        const int span = std::max(1, b.pos - a.pos);
+        const double t = b.pos > a.pos ? static_cast<double>(i - a.pos) / span : 0.0;
+        lut[i][0] = static_cast<uint8_t>(a.r + t * (b.r - a.r));
+        lut[i][1] = static_cast<uint8_t>(a.g + t * (b.g - a.g));
+        lut[i][2] = static_cast<uint8_t>(a.b + t * (b.b - a.b));
+    }
+    return lut;
+}
+
+// «ironbow»: тёмно-синий/фиолетовый (холодно) -> красный/оранжевый -> жёлто-белый (горячо).
+const Lut256& ironbow_lut() {
+    static const Lut256 lut = build_lut({
+        {0,   0,   0,   40},
+        {40,  40,  0,   110},
+        {90,  130, 0,   110},
+        {140, 200, 30,  0},
+        {180, 240, 100, 0},
+        {220, 255, 200, 0},
+        {255, 255, 255, 255},
+    });
+    return lut;
+}
+
+// «rainbow»: тот же диапазон, что ironbow, но шире гамма (добавлен зелёный) — лучше видны
+// минимальные перепады температур в однородной сцене.
+const Lut256& rainbow_lut() {
+    static const Lut256 lut = build_lut({
+        {0,   0,   0,   130},
+        {50,  0,   0,   255},
+        {90,  0,   200, 255},
+        {128, 0,   255, 0},
+        {170, 255, 255, 0},
+        {210, 255, 128, 0},
+        {255, 255, 0,   0},
+    });
+    return lut;
+}
+
+}  // namespace
+
 struct ThermalCameraImpl {
     std::string device;
     int width = 640, height = 512, version = 1;
@@ -22,12 +78,13 @@ struct ThermalCameraImpl {
 
     std::mutex mu;
     std::condition_variable cv;
-    std::vector<uint8_t> latest_rgb;    // width*height*3 (grayscale, R=G=B=люма)
+    std::vector<uint8_t> latest_rgb;    // width*height*3 (grayscale/палитра)
     int lw = 0, lh = 0;
     uint64_t seq = 0, last_delivered = 0;
     bool connected = false;
     double hot = 0, cold = 0, cursor = 0, mean = 0;
     bool has_temps = false;
+    std::atomic<int> palette{0};        // ThermalPalette, читается в SDK-коллбэке без блокировки
 };
 
 // Коллбэки SDK — плоские C-указатели без user-data, поэтому один глобальный экземпляр
@@ -53,11 +110,20 @@ static int on_frame(guide_usb_frame_data_t* fd) {
         const size_t nbytes = static_cast<size_t>(fd->frame_yuv_data_length) * 2;
         const size_t npix = static_cast<size_t>(w) * h;
         if (nbytes >= npix * 2) {
+            const auto pal = static_cast<ThermalPalette>(p->palette.load(std::memory_order_relaxed));
             std::lock_guard<std::mutex> lk(p->mu);
             p->latest_rgb.resize(npix * 3);
-            for (size_t i = 0; i < npix; ++i) {
-                const uint8_t luma = yuv[i * 2];
-                p->latest_rgb[i * 3] = p->latest_rgb[i * 3 + 1] = p->latest_rgb[i * 3 + 2] = luma;
+            if (pal == ThermalPalette::Gray) {
+                for (size_t i = 0; i < npix; ++i) {
+                    const uint8_t luma = yuv[i * 2];
+                    p->latest_rgb[i * 3] = p->latest_rgb[i * 3 + 1] = p->latest_rgb[i * 3 + 2] = luma;
+                }
+            } else {
+                const Lut256& lut = (pal == ThermalPalette::Ironbow) ? ironbow_lut() : rainbow_lut();
+                for (size_t i = 0; i < npix; ++i) {
+                    const auto& c = lut[yuv[i * 2]];
+                    p->latest_rgb[i * 3] = c[0]; p->latest_rgb[i * 3 + 1] = c[1]; p->latest_rgb[i * 3 + 2] = c[2];
+                }
             }
             p->lw = w; p->lh = h; ++p->seq;
             p->cv.notify_one();
@@ -143,6 +209,19 @@ bool ThermalCamera::temps(double& hot, double& cold, double& cursor, double& mea
     if (!p_->has_temps) return false;
     hot = p_->hot; cold = p_->cold; cursor = p_->cursor; mean = p_->mean;
     return true;
+}
+
+void ThermalCamera::setPalette(ThermalPalette p) {
+    p_->palette.store(static_cast<int>(p), std::memory_order_relaxed);
+}
+
+ThermalPalette ThermalCamera::getPalette() const {
+    return static_cast<ThermalPalette>(p_->palette.load(std::memory_order_relaxed));
+}
+
+const std::vector<std::string>& ThermalCamera::paletteNames() {
+    static const std::vector<std::string> names = {"gray", "ironbow", "rainbow"};
+    return names;
 }
 
 }  // namespace camctl
